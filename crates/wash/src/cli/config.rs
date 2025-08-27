@@ -4,7 +4,7 @@ use etcetera::AppStrategy as _;
 use tracing::instrument;
 
 use crate::{
-    cli::{CliContext, CommandOutput},
+    cli::{CliCommand, CliContext, CommandOutput},
     config::generate_default_config,
 };
 
@@ -21,17 +21,18 @@ pub enum ConfigCommand {
     Info {},
     /// Print the current configuration file for wash
     Show {},
-    // TODO: validate config command
-    // TODO: cleanup config command, to clean the dirs we use
+    // TODO(#27): validate config command
+    // TODO(#29): cleanup config command, to clean the dirs we use
 }
 
-impl ConfigCommand {
+impl CliCommand for ConfigCommand {
     #[instrument(level = "debug", skip_all, name = "config")]
-    pub async fn handle(self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
+    async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
         match self {
             ConfigCommand::Init { force } => {
                 let config_path = ctx.config_path();
-                generate_default_config(&config_path, force)
+                generate_default_config(&config_path, *force)
+                    .await
                     .context("failed to initialize config")?;
 
                 Ok(CommandOutput::ok(
@@ -51,8 +52,7 @@ impl ConfigCommand {
 
                 Ok(CommandOutput::ok(
                     format!(
-                        "wash version: {}\nData directory: {}\nCache directory: {}\nConfig directory: {}\nConfig path: {}",
-                        version, data_dir, cache_dir, config_dir, config_path
+                        "wash version: {version}\nData directory: {data_dir}\nCache directory: {cache_dir}\nConfig directory: {config_dir}\nConfig path: {config_path}"
                     ),
                     Some(serde_json::json!({
                         "version": version,
@@ -64,7 +64,10 @@ impl ConfigCommand {
                 ))
             }
             ConfigCommand::Show {} => {
-                let config = ctx.ensure_config().context("failed to load config")?;
+                let config = ctx
+                    .ensure_config(None)
+                    .await
+                    .context("failed to load config")?;
                 Ok(CommandOutput::ok(
                     serde_json::to_string_pretty(&config).context("failed to serialize config")?,
                     Some(serde_json::to_value(&config).context("failed to serialize config")?),

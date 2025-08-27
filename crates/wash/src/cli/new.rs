@@ -9,7 +9,7 @@ use tokio::fs;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
-    cli::{CliContext, CommandOutput},
+    cli::{CliCommand, CliContext, CommandOutput},
     config::Config,
     new::{NewTemplate, TemplateLanguage, clone_template, copy_dir_recursive, extract_subfolder},
 };
@@ -39,10 +39,10 @@ pub struct NewCommand {
     local: Option<PathBuf>,
 }
 
-impl NewCommand {
+impl CliCommand for NewCommand {
     #[instrument(level = "debug", skip(self, ctx), name = "new")]
-    pub async fn handle(self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
-        let config = ctx.ensure_config().unwrap_or_else(|e| {
+    async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
+        let config = ctx.ensure_config(None).await.unwrap_or_else(|e| {
             warn!(error = %e, "Failed to load global configuration");
             Config::default()
         });
@@ -75,9 +75,11 @@ impl NewCommand {
             self.interactive_select(ctx, &config).await
         }
     }
+}
 
+impl NewCommand {
     async fn interactive_select(
-        self,
+        &self,
         ctx: &CliContext,
         config: &Config,
     ) -> anyhow::Result<CommandOutput> {
@@ -337,7 +339,7 @@ pub enum TemplateSource {
     Local(PathBuf),
 }
 
-// TODO: support file templates?
+// TODO(GFI#2): support file templates?
 // All templates are git repositories for now.
 impl From<&NewTemplate> for TemplateSource {
     fn from(source: &NewTemplate) -> Self {

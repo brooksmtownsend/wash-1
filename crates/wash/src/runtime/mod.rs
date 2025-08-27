@@ -1,56 +1,56 @@
-use anyhow::{self, Context as _, ensure};
-use sha2::{Digest as _, Sha256};
+use anyhow::{self, Context as _};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use tokio::sync::RwLock;
+use tokio::{process::Child, sync::RwLock};
 use tracing::{debug, error, info, trace, warn};
 use wasmcloud_runtime::Runtime;
 use wasmcloud_runtime::capability::config::runtime::ConfigError;
 use wasmcloud_runtime::capability::logging::logging::Level;
 use wasmcloud_runtime::component::BaseCtx;
-use wasmtime::{
-    AsContextMut as _, StoreContextMut,
-    component::{
-        Component, Instance, InstancePre, Linker, ResourceAny, ResourceTable, ResourceType, Val,
-        types::ComponentItem,
-    },
-};
-use wasmtime_wasi::{IoImpl, IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime::component::ResourceTable;
+use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-use crate::runtime::{
-    types::{WasmcloudWashCtx, WasmcloudWashImpl, WasmcloudWashView},
-    value::{is_host_resource_type, lift, lower},
+use crate::{
+    dev::DevPluginManager, plugin::PluginComponent, runtime::wasm::link_imports_plugin_exports,
 };
 
 pub mod bindings;
-pub(crate) mod types;
-mod value;
+pub mod plugin;
+mod wasm;
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone)]
-pub enum CapabilityPlugin {
-    Blobstore,
-}
-
+/// The context for a component store and linker, providing access to implementations of:
+/// - wasi@0.2 interfaces
+/// - `wasi:logging/logging`
+/// - `wasi:config/runtime`
+/// - `wasi:http`
+/// - `wasmcloud:wash/plugin`
 pub struct Ctx {
-    pub wash_ctx: WasmcloudWashCtx,
+    /// Unique identifier for this component context. Primarily used for logging, debugging, and
+    /// plugin instance management. This is a [uuid::Uuid::now_v7] string.
+    pub id: String,
+    /// The resource table used to manage resources in the Wasmtime store.
     pub table: wasmtime::component::ResourceTable,
+    /// The WASI context used to provide WASI functionality to the component.
     pub ctx: WasiCtx,
+    /// The HTTP context used to provide HTTP functionality to the component.
     pub http: WasiHttpCtx,
 
-    /// `wasi:config/runtime` uses this hashmap to retrieve runtime configuration
+    /// Powers the built-in implementation of `wasi:config/runtime`
     pub runtime_config: Arc<RwLock<HashMap<String, String>>>,
-    /// `wasi:blobstore/blobstore` uses this path to store blobs
-    pub blobstore_root: Option<PathBuf>,
+    /// Stores the handles to background processes spawned by host_exec_background. Once this
+    /// context struct is dropped the processes will be removed
+    pub background_processes: Arc<RwLock<Vec<Child>>>,
 }
 
+/// Helper struct to build a [`Ctx`] with a builder pattern
 pub struct CtxBuilder {
     ctx: WasiCtx,
-    runtime_config: Option<HashMap<String, String>>,
-    blobstore_root: Option<PathBuf>,
+    runtime_config: Option<Arc<RwLock<HashMap<String, String>>>>,
+    background_processes: Option<Arc<RwLock<Vec<Child>>>>,
 }
 
 impl CtxBuilder {
@@ -61,7 +61,7 @@ impl CtxBuilder {
                 .inherit_stderr()
                 .build(),
             runtime_config: None,
-            blobstore_root: None,
+            background_processes: None,
         }
     }
 
@@ -70,21 +70,34 @@ impl CtxBuilder {
         self
     }
 
+    /// Sets the runtime configuration for the context. If you want to modify the configuration after
+    /// the context is build, you can use [`CtxBuilder::with_runtime_config_arc`] instead.
     pub fn with_runtime_config(mut self, config: HashMap<String, String>) -> Self {
+        self.runtime_config = Some(Arc::new(RwLock::new(config)));
+        self
+    }
+
+    /// Sets the runtime configuration for the context using an Arc-wrapped RwLock. This allows for modifying
+    /// the configuration after the context is built, as the Arc can be cloned and shared across threads.
+    ///
+    /// Take care to avoid deadlocks when using this method, as the RwLock is shared across threads.
+    pub fn with_runtime_config_arc(mut self, config: Arc<RwLock<HashMap<String, String>>>) -> Self {
         self.runtime_config = Some(config);
         self
     }
 
-    pub fn with_blobstore_root(mut self, path: Option<PathBuf>) -> Self {
-        self.blobstore_root = path;
+    /// Sets the background processes list for the context using an Arc-wrapped RwLock. This allows sharing
+    /// the background processes list across multiple Ctx instances, typically from CliContext.
+    pub fn with_background_processes(mut self, processes: Arc<RwLock<Vec<Child>>>) -> Self {
+        self.background_processes = Some(processes);
         self
     }
 
     pub fn build(self) -> Ctx {
         Ctx {
-            runtime_config: Arc::new(RwLock::new(self.runtime_config.unwrap_or_default())),
-            blobstore_root: self.blobstore_root,
             ctx: self.ctx,
+            runtime_config: self.runtime_config.unwrap_or_default(),
+            background_processes: self.background_processes.unwrap_or_default(),
             ..Default::default()
         }
     }
@@ -98,22 +111,22 @@ impl Default for CtxBuilder {
 
 impl Ctx {
     pub fn builder() -> CtxBuilder {
-        CtxBuilder::new()
+        CtxBuilder::default()
     }
 }
 
 impl Default for Ctx {
     fn default() -> Self {
         Self {
-            wash_ctx: WasmcloudWashCtx::default(),
+            id: uuid::Uuid::now_v7().to_string(),
             table: ResourceTable::new(),
             ctx: WasiCtxBuilder::new()
                 .args(&["main.wasm"])
                 .inherit_stderr()
                 .build(),
             http: WasiHttpCtx::new(),
-            blobstore_root: None,
-            runtime_config: Arc::new(RwLock::new(HashMap::new())),
+            runtime_config: Arc::default(),
+            background_processes: Arc::default(),
         }
     }
 }
@@ -121,37 +134,40 @@ impl Default for Ctx {
 impl Debug for Ctx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ctx")
-            .field("wash_ctx", &self.wash_ctx)
+            .field("id", &self.id)
             .field("table", &self.table)
+            .field("http", &self.http)
+            .field("runtime_config", &self.runtime_config)
+            .field("background_processes", &self.background_processes)
             .finish()
     }
 }
+// Implement the base context for wasmcloud_runtime
 impl BaseCtx for Ctx {}
+// Implement IoView for resources
 impl IoView for Ctx {
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table
     }
 }
+// Implement WasiView for wasi@0.2 interfaces
 impl WasiView for Ctx {
     fn ctx(&mut self) -> &mut WasiCtx {
         &mut self.ctx
     }
 }
+// Implement WasiHttpView for wasi:http@0.2
 impl WasiHttpView for Ctx {
     fn ctx(&mut self) -> &mut WasiHttpCtx {
         &mut self.http
     }
 }
-impl WasmcloudWashView for Ctx {
-    fn ctx(&mut self) -> &mut WasmcloudWashCtx {
-        &mut self.wash_ctx
-    }
-}
 
+// TODO(IMPORTANT): Remove in favor of stdout/stderr logging
+// Implementation of `wasi:logging/logging` using the `tracing` crate
 impl wasmcloud_runtime::capability::logging::logging::Host for Ctx {
     async fn log(&mut self, level: Level, context: String, message: String) -> anyhow::Result<()> {
         match level {
-            // TODO: Include some kind of information about the component as an attribute
             Level::Critical => error!(ctx = context, "{message}"),
             Level::Error => error!(ctx = context, "{message}"),
             Level::Warn => warn!(ctx = context, "{message}"),
@@ -163,7 +179,7 @@ impl wasmcloud_runtime::capability::logging::logging::Host for Ctx {
     }
 }
 
-/// Implementation of `wasi:config/runtime` using an in-memory key-value store
+// Implementation of `wasi:config/runtime` using an in-memory key-value store
 impl wasmcloud_runtime::capability::config::runtime::Host for Ctx {
     async fn get(&mut self, key: String) -> anyhow::Result<Result<Option<String>, ConfigError>> {
         Ok(Ok(self.runtime_config.read().await.get(&key).cloned()))
@@ -174,17 +190,13 @@ impl wasmcloud_runtime::capability::config::runtime::Host for Ctx {
             .runtime_config
             .read()
             .await
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .clone()
+            .into_iter()
             .collect()))
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ComponentHandler {
-    _priv: (),
-}
-
+/// Create a new [`wasmcloud_runtime::Runtime`], returning the runtime and a handle to the runtime thread.
 pub async fn new_runtime() -> anyhow::Result<(Runtime, JoinHandle<Result<(), ()>>)> {
     wasmcloud_runtime::RuntimeBuilder::new().build()
 }
@@ -192,241 +204,37 @@ pub async fn new_runtime() -> anyhow::Result<(Runtime, JoinHandle<Result<(), ()>
 /// Creates a WebAssembly component from bytes and compiles using [Runtime].
 ///
 /// This function is used to prepare a component for use in the plugin system, adding in core
-/// WASI interfaces with [wasmtime_wasi::add_to_linker_async] and linking the `wash` host
+/// WASI interfaces with [wasmtime_wasi::add_to_linker_async] and linking the wash host
 /// interface.
 pub async fn prepare_component_plugin(
     runtime: &Runtime,
     wasm: &[u8],
-) -> anyhow::Result<wasmcloud_runtime::component::CustomCtxComponent<Ctx>> {
+    data_dir: Option<&Path>,
+) -> anyhow::Result<PluginComponent> {
     let component = wasmcloud_runtime::component::CustomCtxComponent::new_with_linker_minimal(
         runtime,
         wasm,
         |linker, _component| {
+            // Wasi 0.2 interfaces
             wasmtime_wasi::add_to_linker_async(linker)
                 .context("failed to link core WASI interfaces")?;
+            // Logging
             wasmcloud_runtime::capability::logging::logging::add_to_linker(linker, |ctx| ctx)
                 .context("failed to link `wasi:logging/logging`")?;
-
-            // Add wash plugin host
-            add_to_linker_async(linker).context("failed to link `wash`")?;
-            // TODO: impl on Ctx
-            // host::wash::types::add_to_linker_get_host(linker, |ctx| ctx);
+            // Runtime config
+            wasmcloud_runtime::capability::config::runtime::add_to_linker(linker, |ctx| ctx)
+                .context("failed to link `wasi:config/runtime`")?;
+            // HTTP
+            wasmtime_wasi_http::add_only_http_to_linker_async(linker)
+                .context("failed to link `wasi:http`")?;
+            // Plugin host
+            bindings::plugin::WashPlugin::add_to_linker(linker, |ctx| ctx)
+                .context("failed to link `wasmcloud:wash/plugin`")?;
             Ok(())
         },
     )?;
 
-    Ok(component)
-}
-
-/// This function plugs a components imports with the exports of other components
-/// that are already loaded in the plugin system.
-pub fn link_imports_plugin_exports(
-    linker: &mut Linker<Ctx>,
-    component: &Component,
-    plugin_manager: Arc<DevPluginManager>,
-) -> anyhow::Result<()> {
-    let ty = component.component_type();
-    let imports: Vec<_> = ty.imports(component.engine()).collect();
-    for (import_name, import_item) in imports.into_iter() {
-        match import_item {
-            ComponentItem::ComponentInstance(import_instance_ty) => {
-                debug!(name = import_name, "processing component instance import");
-                let (plugin_component, instance_idx) = {
-                    let Some(plugin_component) = plugin_manager.get_component(import_name) else {
-                        debug!(name = import_name, "import not found in plugins, skipping");
-                        continue;
-                    };
-                    let Some((ComponentItem::ComponentInstance(_), idx)) =
-                        plugin_component.export_index(None, import_name)
-                    else {
-                        debug!(name = import_name, "skipping non-instance import");
-                        continue;
-                    };
-                    (plugin_component, idx)
-                };
-                debug!(name = import_name, index = ?instance_idx, "found import at index");
-
-                // Preinstantiate the instance so we can use it later
-                let pre = plugin_manager.preinstantiate_instance(linker, import_name)?;
-
-                let mut linker_instance = match linker.instance(import_name) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        debug!(name = import_name, error = %e, "error finding instance in linker, skipping");
-                        continue;
-                    }
-                };
-
-                for (export_name, export_ty) in
-                    import_instance_ty.exports(plugin_component.engine())
-                {
-                    match export_ty {
-                        ComponentItem::ComponentFunc(_func_ty) => {
-                            let (item, func_idx) = match plugin_component
-                                .export_index(Some(&instance_idx), export_name)
-                            {
-                                Some(res) => res,
-                                None => {
-                                    debug!(
-                                        name = import_name,
-                                        fn_name = export_name,
-                                        "failed to get export index, skipping"
-                                    );
-                                    continue;
-                                }
-                            };
-                            ensure!(
-                                matches!(item, ComponentItem::ComponentFunc(..)),
-                                "expected function export, found other"
-                            );
-                            debug!(
-                                name = import_name,
-                                fn_name = export_name,
-                                "linking function import"
-                            );
-                            let import_name: Arc<str> = import_name.into();
-                            let export_name: Arc<str> = export_name.into();
-                            let pre = pre.clone();
-                            let plugin_manager = plugin_manager.clone();
-                            linker_instance
-                                .func_new_async(
-                                    &export_name.clone(),
-                                    move |mut store, params, results| {
-                                        let import_name = import_name.clone();
-                                        let export_name = export_name.clone();
-                                        let plugin_manager = plugin_manager.clone();
-                                        let pre = pre.clone();
-                                        Box::new(async move {
-                                            let instance = plugin_manager
-                                                .get_or_instantiate_instance(
-                                                    &mut store,
-                                                    pre,
-                                                    &import_name,
-                                                )
-                                                .await?;
-
-                                            let func = instance
-                                                .get_func(&mut store, func_idx)
-                                                .context("function not found")?;
-                                            trace!(
-                                                name = %import_name,
-                                                fn_name = %export_name,
-                                                ?params,
-                                                "lowering params"
-                                            );
-                                            let mut params_buf = Vec::with_capacity(params.len());
-                                            for param_val in params.iter() {
-                                                params_buf.push(
-                                                    lower(&mut store, param_val)
-                                                        .context("failed to lower parameter")?,
-                                                );
-                                            }
-                                            trace!(
-                                                name = %import_name,
-                                                fn_name = %export_name,
-                                                ?params_buf,
-                                                "invoking dynamic export"
-                                            );
-
-                                            let mut results_buf =
-                                                vec![Val::Bool(false); results.len()];
-                                            func.call_async(
-                                                &mut store,
-                                                &params_buf,
-                                                &mut results_buf,
-                                            )
-                                            .await
-                                            .context("failed to call function")?;
-                                            trace!(
-                                                name = %import_name,
-                                                fn_name = %export_name,
-                                                ?results_buf,
-                                                "lifting results"
-                                            );
-                                            for (i, result_val) in
-                                                results_buf.into_iter().enumerate()
-                                            {
-                                                results[i] = lift(&mut store, result_val)
-                                                    .context("failed to lift result")?;
-                                            }
-                                            trace!(
-                                                name = %import_name,
-                                                fn_name = %export_name,
-                                                ?results,
-                                                "invoked dynamic export"
-                                            );
-
-                                            func.post_return_async(&mut store)
-                                                .await
-                                                .context("failed to execute post-return")?;
-                                            Ok(())
-                                        })
-                                    },
-                                )
-                                .expect("failed to create async func");
-                        }
-                        ComponentItem::Resource(resource_ty) => {
-                            if is_host_resource_type(resource_ty) {
-                                debug!(name = import_name, resource = ?resource_ty, "skipping host resource type");
-                                continue;
-                            }
-
-                            let (item, _idx) = match plugin_component
-                                .export_index(Some(&instance_idx), export_name)
-                            {
-                                Some(res) => res,
-                                None => {
-                                    debug!(
-                                        name = import_name,
-                                        resource = export_name,
-                                        "failed to get resource index, skipping"
-                                    );
-                                    continue;
-                                }
-                            };
-                            let ComponentItem::Resource(_) = item else {
-                                debug!(
-                                    name = import_name,
-                                    resource = export_name,
-                                    "expected resource export, found non-resource, skipping"
-                                );
-                                continue;
-                            };
-
-                            debug!(name = import_name, resource = export_name, ty = ?resource_ty, "linking resource import");
-                            linker_instance
-                                .resource(export_name, ResourceType::host::<ResourceAny>(), |_, _| Ok(()))
-                                .with_context(|| {
-                                    format!(
-                                        "failed to define resource import: {import_name}.{export_name}"
-                                    )
-                                })
-                                .unwrap_or_else(|e| {
-                                    debug!(name = import_name, resource = export_name, error = %e, "error defining resource import, skipping");
-                                });
-                        }
-                        _ => {
-                            trace!(
-                                name = import_name,
-                                fn_name = export_name,
-                                "skipping non-function non-resource import"
-                            );
-                            continue;
-                        }
-                    }
-                }
-            }
-            ComponentItem::Resource(resource_ty) => {
-                debug!(
-                    name = import_name,
-                    ty = ?resource_ty,
-                    "component import is a resource, which is not supported in this context. skipping."
-                );
-            }
-            _ => continue,
-        }
-    }
-    Ok(())
+    PluginComponent::new(component, data_dir).await
 }
 
 /// Creates a WebAssembly component from bytes and compiles using [Runtime].
@@ -459,12 +267,11 @@ pub async fn prepare_component_dev(
                 .context("failed to link `wasi:http`")?;
             wasmcloud_runtime::capability::logging::logging::add_to_linker(linker, |ctx| ctx)
                 .context("failed to link `wasi:logging/logging`")?;
-            add_to_linker_async(linker)
-                .context("failed to link `wasmcloud:wash` host interface")?;
-
-            // TODO: Use a component that sources env vars for this
             wasmcloud_runtime::capability::config::runtime::add_to_linker(linker, |ctx| ctx)
                 .context("failed to link `wasi:config/runtime`")?;
+
+            bindings::plugin::WashPlugin::add_to_linker(linker, |ctx| ctx)
+                .context("failed to link `wasmcloud:wash` host interface")?;
 
             // Link additional configured plugins
             link_imports_plugin_exports(linker, component, plugin_manager)
@@ -477,146 +284,18 @@ pub async fn prepare_component_dev(
     Ok(component)
 }
 
-//TODO: kill these? I don't think we need it if I impl on the Ctx properly instead of WasmcloudWashView
-/// Helper function to properly type annotate the Linker's generic type
-fn add_to_linker_async<T: WasmcloudWashView>(linker: &mut Linker<T>) -> anyhow::Result<()> {
-    bindings::plugin_host::wasmcloud::wash::types::add_to_linker_get_host(
-        linker,
-        type_annotate::<T, _>(|t| WasmcloudWashImpl(IoImpl(t))),
-    )?;
-
-    Ok(())
-}
-
-fn type_annotate<T: WasmcloudWashView, F>(val: F) -> F
-where
-    F: Fn(&mut T) -> WasmcloudWashImpl<&mut T>,
-{
-    val
-}
-
-// what we basically want is a lookup from instance to Component to start, but then
-// to manage a single Instance for that component. E.g. blobstore,container,types should all go to the same instance once instantiated
-
-// I think we can have the plugins managed by a struct, and use methods for properly looking these up
-
-// A hash of the component bytes
-type ComponentKey = String;
-
-/// This struct intentionally doesn't derive clone as it should be Arc-ed to share it across threads.
-#[derive(Default)]
-pub struct DevPluginManager {
-    // interface name → component key (deduplicates lookups)
-    interface_map: HashMap<String, ComponentKey>,
-    // component key → compiled component
-    components: HashMap<ComponentKey, Arc<Component>>,
-
-    // component key → instantiated instance (created lazily)
-    instances: RwLock<HashMap<ComponentKey, Arc<Instance>>>,
-}
-
-impl DevPluginManager {
-    pub fn register_plugin(&mut self, runtime: &Runtime, wasm: &[u8]) -> anyhow::Result<()> {
-        let (component, exports) = initialize_plugin_exports(runtime, wasm)?;
-
-        let key = format!("{:x}", Sha256::digest(wasm));
-        for (name, item) in exports {
-            if let ComponentItem::ComponentInstance(_) = item {
-                // Register the interface name to the component key
-                if self.interface_map.contains_key(&name) {
-                    anyhow::bail!("another plugin already implements the interface '{name}'");
-                }
-                self.interface_map.insert(name.clone(), key.clone());
-            } else {
-                warn!(name, "exported item is not a component instance, skipping");
-            }
-        }
-
-        self.components.insert(key.clone(), Arc::new(component));
-
-        Ok(())
-    }
-
-    /// Looks up a component for an interface name, or returns None if not found.
-    pub fn get_component(&self, name: &str) -> Option<Arc<Component>> {
-        let key = self.interface_map.get(name)?;
-        self.components.get(key).cloned()
-    }
-
-    pub fn preinstantiate_instance(
-        &self,
-        linker: &Linker<Ctx>,
-        name: &str,
-    ) -> anyhow::Result<Arc<InstancePre<Ctx>>> {
-        info!(name, "preinstantiating instance for component");
-        let component = self.get_component(name).context("component not found")?;
-        let instance = linker.instantiate_pre(&component)?;
-        Ok(Arc::new(instance))
-    }
-
-    pub async fn get_or_instantiate_instance(
-        &self,
-        store: &mut StoreContextMut<'_, Ctx>,
-        pre: Arc<InstancePre<Ctx>>,
-        name: &str,
-    ) -> anyhow::Result<Arc<Instance>> {
-        let key = self
-            .interface_map
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("no component implements interface {name}"))?;
-        if let Some(instance) = self.instances.read().await.get(key) {
-            return Ok(instance.clone());
-        }
-
-        let instance = pre.instantiate_async(store.as_context_mut()).await?;
-        let instance = Arc::new(instance);
-
-        self.instances
-            .write()
-            .await
-            .insert(key.to_string(), instance.clone());
-
-        Ok(instance)
-    }
-}
-
-/// Inspects a WebAssembly component and returns its exports, specifically looking for
-/// component instances that can be used as plugins. More could be implemented in terms of
-/// exports, but `wash` primarily supports using component instances as plugins.
-fn initialize_plugin_exports(
-    runtime: &Runtime,
-    wasm: &[u8],
-) -> anyhow::Result<(Component, Vec<(String, ComponentItem)>)> {
-    let component = wasmtime::component::Component::new(runtime.engine(), wasm)
-        .context("failed to create component from wasm")?;
-    let exports = component
-        .component_type()
-        .exports(runtime.engine())
-        .filter_map(|(name, item)| {
-            // An instance in this case is something like `wasi:blobstore/blobstore@0.2.0-draft`, or an
-            // entire interface that's exported.
-            if matches!(item, ComponentItem::ComponentInstance(_)) {
-                Some((name.to_string(), item))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    Ok((component, exports))
-}
-
 #[cfg(test)]
 mod test {
     use http_body_util::BodyExt;
     use tempfile::TempDir;
     use wasmtime_wasi::{DirPerms, FilePerms};
     use wasmtime_wasi_http::{
-        bindings::http::types::Scheme,
+        bindings::http::types::{ErrorCode, Scheme},
         body::{HostIncomingBody, HyperIncomingBody},
         types::HostIncomingRequest,
     };
 
-    use crate::runtime::bindings::{dev::Dev, plugin_guest::PluginGuest};
+    use crate::{dev::DevPluginManager, runtime::bindings::dev::Dev};
 
     use super::*;
 
@@ -625,30 +304,24 @@ mod test {
     #[tokio::test]
     async fn can_instantiate_plugin() -> anyhow::Result<()> {
         // Built from ./plugins/blobstore-filesystem
-        let wasm = std::fs::read("./tests/fixtures/blobstore_filesystem.wasm")?;
+        let wasm = tokio::fs::read("./tests/fixtures/blobstore_filesystem.wasm").await?;
 
         let (runtime, _handle) = new_runtime().await?;
-        let base_ctx = Ctx::default();
 
-        let component = prepare_component_plugin(&runtime, &wasm).await?;
-        let mut store = component.new_store(base_ctx);
+        let component = prepare_component_plugin(&runtime, &wasm, None).await?;
+        let metadata = component.call_info(Ctx::default()).await?;
 
-        let instance = component
-            .instance_pre()
-            .instantiate_async(&mut store)
-            .await?;
-        let wash_plugin = PluginGuest::new(&mut store, &instance)?;
-        let _ = wash_plugin
-            .wasmcloud_wash_plugin()
-            .call_info(&mut store)
-            .await?;
+        assert_eq!(metadata.name, "blobstore-filesystem");
 
         Ok(())
     }
 
     #[tokio::test]
     async fn can_instantiate_http_component() -> anyhow::Result<()> {
-        let wasm = std::fs::read("./tests/fixtures/http_hello_world_rust.wasm")?;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        let wasm = tokio::fs::read("./tests/fixtures/http_hello_world_rust.wasm").await?;
 
         let (runtime, _handle) = new_runtime().await?;
         let base_ctx = Ctx::default();
@@ -706,19 +379,20 @@ mod test {
 
     #[tokio::test]
     async fn can_instantiate_blobstore_component() -> anyhow::Result<()> {
-        tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .init();
+            .try_init();
 
         let (runtime, _handle) = new_runtime().await?;
 
         // This component has a `wasi:blobstore/blobstore` IMPORT
-        let wasm = std::fs::read("./tests/fixtures/blobstore_from_fs.wasm")?;
-        let blobstore_plugin = std::fs::read("./tests/fixtures/blobstore_filesystem.wasm")?;
+        let wasm = tokio::fs::read("./tests/fixtures/http_blobstore.wasm").await?;
+        let blobstore_plugin =
+            tokio::fs::read("./tests/fixtures/blobstore_filesystem.wasm").await?;
 
         let mut plugin_manager = DevPluginManager::default();
         plugin_manager
-            .register_plugin(&runtime, &blobstore_plugin)
+            .register_plugin(prepare_component_plugin(&runtime, &blobstore_plugin, None).await?)
             .context("failed to register blobstore plugin")?;
         let component = prepare_component_dev(&runtime, &wasm, Arc::new(plugin_manager)).await?;
 
@@ -730,7 +404,7 @@ mod test {
         let base_ctx = Ctx::builder()
             .with_wasi_ctx(
                 WasiCtxBuilder::new()
-                    .preopened_dir(tmp_path, "/tmp", DirPerms::all(), FilePerms::all())
+                    .preopened_dir(&tmp_path, "/tmp", DirPerms::all(), FilePerms::all())
                     .context("failed to create preopened dir")?
                     .build(),
             )
@@ -747,10 +421,16 @@ mod test {
             .context("failed to pre-instantiate `wasi:http/incoming-handler`")?;
 
         let data = store.data_mut();
+        let body = HyperIncomingBody::new(
+            // One gigabyte of data. Larger than this will hang on the get_data TODO: investigate
+            http_body_util::Full::new(hyper::body::Bytes::from("0123456789".repeat(100_000)))
+                .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))
+                .boxed(),
+        );
         let request: ::http::Request<wasmtime_wasi_http::body::HyperIncomingBody> =
             http::Request::builder()
                 .uri("http://localhost:8080")
-                .body(HyperIncomingBody::default())
+                .body(body)
                 .context("failed to create request")?;
 
         let (parts, body) = request.into_parts();
@@ -780,8 +460,9 @@ mod test {
             .await
             .context("failed to collect body bytes")?
             .to_bytes();
-        let body_str = String::from_utf8_lossy(&body);
-        assert_eq!(body_str, "my-container-real");
+        assert_eq!(body.len(), 1_000_000);
+
+        eprintln!("roundtrip streamed data: {}", body.len());
 
         Ok(())
     }

@@ -1,15 +1,13 @@
 //! CLI command for checking the wash environment and providing recommendations for common issues or missing tools
 
+use crate::cli::{CliCommand, CliContext, CommandOutput};
 use anyhow::{Context as _, bail};
 use clap::Args;
 use etcetera::AppStrategy as _;
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
-use tracing::{debug, error, instrument, trace};
-
-use crate::cli::{CliContext, CommandOutput};
+use std::path::{Path, PathBuf};
+use tokio::process::Command;
+use tracing::{debug, instrument, trace};
+use which::which;
 
 #[derive(Debug, Clone, Args)]
 pub struct DoctorCommand {
@@ -33,9 +31,9 @@ pub enum ProjectContext {
     Mixed { detected_types: Vec<String> },
 }
 
-impl DoctorCommand {
+impl CliCommand for DoctorCommand {
     #[instrument(level = "debug", skip_all, name = "doctor")]
-    pub async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
+    async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
         let data_dir = ctx.data_dir();
         let cache_dir = ctx.cache_dir();
         let config_dir = ctx.config_dir();
@@ -180,7 +178,8 @@ impl DoctorCommand {
         ]);
 
         // Add context-specific tool sections
-        self.add_context_specific_output(&project_context, &mut output_lines);
+        self.add_context_specific_output(&project_context, &mut output_lines)
+            .await;
 
         // Add recommendations section if there are any issues
         if !recommendations.is_empty() {
@@ -233,9 +232,11 @@ impl DoctorCommand {
 
         Ok(CommandOutput::ok(output_lines.join("\n"), Some(json_data)))
     }
+}
 
+impl DoctorCommand {
     /// Add context-specific output to the display
-    fn add_context_specific_output(
+    async fn add_context_specific_output(
         &self,
         context: &ProjectContext,
         output_lines: &mut Vec<String>,
@@ -261,21 +262,27 @@ impl DoctorCommand {
                     format!("  cargo: {status}", status = tool_status("cargo")),
                 ]);
 
-                // Check wasm32-wasip2 target synchronously for display
+                // Check wasm32-wasip2 target asynchronously for display
                 if binary_exists_in_path("cargo") {
-                    let target_status = match std::process::Command::new("rustup")
-                        .args(["target", "list", "--installed"])
-                        .output()
-                    {
-                        Ok(output) if output.status.success() => {
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            if stdout.lines().any(|line| line.trim() == "wasm32-wasip2") {
-                                "✅ installed"
-                            } else {
-                                "❌ not found"
+                    let target_status = match which("rustup") {
+                        Ok(rustup_path) => {
+                            match Command::new(rustup_path)
+                                .args(["target", "list", "--installed"])
+                                .output()
+                                .await
+                            {
+                                Ok(output) if output.status.success() => {
+                                    let stdout = String::from_utf8_lossy(&output.stdout);
+                                    if stdout.lines().any(|line| line.trim() == "wasm32-wasip2") {
+                                        "✅ installed"
+                                    } else {
+                                        "❌ not found"
+                                    }
+                                }
+                                _ => "🟨 check failed",
                             }
                         }
-                        _ => "🟨 check failed",
+                        Err(_) => "🟨 rustup not found",
                     };
                     output_lines.push(format!("  wasm32-wasip2: {target_status}"));
                 }
@@ -460,7 +467,7 @@ pub async fn check_project_specific_tools(
             check_rust_tools(&mut issues, &mut recommendations).await?;
         }
         ProjectContext::Go { .. } => {
-            check_go_tools(&mut issues, &mut recommendations).await?;
+            check_go_tools(&mut issues, &mut recommendations);
         }
         ProjectContext::TypeScript { .. } => {
             check_typescript_tools(&mut issues, &mut recommendations);
@@ -471,7 +478,7 @@ pub async fn check_project_specific_tools(
                 check_rust_tools(&mut issues, &mut recommendations).await?;
             }
             if detected_types.iter().any(|t| t == "Go") {
-                check_go_tools(&mut issues, &mut recommendations).await?;
+                check_go_tools(&mut issues, &mut recommendations);
             }
             if detected_types.iter().any(|t| t == "TypeScript/JavaScript") {
                 check_typescript_tools(&mut issues, &mut recommendations);
@@ -568,10 +575,7 @@ async fn check_rust_tools(
 }
 
 /// Check tools needed for Go WebAssembly development  
-async fn check_go_tools(
-    issues: &mut Vec<&str>,
-    recommendations: &mut Vec<&str>,
-) -> anyhow::Result<()> {
+fn check_go_tools(issues: &mut Vec<&str>, recommendations: &mut Vec<&str>) {
     // Check for go
     if !binary_exists_in_path("go") {
         issues.push("Go not found (required for Go development)");
@@ -605,8 +609,6 @@ async fn check_go_tools(
         issues.push("wasm-tools not found (recommended for Go WebAssembly)");
         recommendations.push("• Install wasm-tools: 'cargo install wasm-tools'");
     }
-
-    Ok(())
 }
 
 /// Check tools needed for TypeScript/JavaScript development
@@ -646,9 +648,12 @@ fn check_optional_tools(_issues: &mut [&str], recommendations: &mut Vec<&str>) {
 
 /// Check if a Rust target is installed
 async fn check_rust_target(target: &str) -> anyhow::Result<bool> {
-    let output = Command::new("rustup")
+    let rustup_path = which("rustup").context("rustup not found in PATH")?;
+
+    let output = Command::new(rustup_path)
         .args(["target", "list", "--installed"])
         .output()
+        .await
         .context("failed to run rustup target list")?;
 
     if !output.status.success() {
@@ -661,19 +666,12 @@ async fn check_rust_target(target: &str) -> anyhow::Result<bool> {
 
 /// Helper function to check if a binary exists in the system's PATH
 pub fn binary_exists_in_path(binary_name: &str) -> bool {
-    match std::process::Command::new(binary_name).spawn() {
-        Ok(mut child) => {
-            if let Err(e) = child.kill() {
-                error!(binary_name, err = ?e, "failed to kill spawned process when checking for binary");
-            }
-            true
-        }
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => false,
-        Err(e) => {
-            error!(binary_name, err = ?e, "failed to check for binary");
-            false
-        }
-    }
+    which(binary_name).is_ok()
+}
+
+/// Helper function to get the full path of a binary in the system's PATH
+pub fn get_binary_path(binary_name: &str) -> Option<PathBuf> {
+    which(binary_name).ok()
 }
 
 /// Helper function to get tool status string
