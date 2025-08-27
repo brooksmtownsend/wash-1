@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::SystemTime,
 };
 
 use anyhow::{Context as _, ensure};
@@ -64,6 +65,67 @@ fn is_ignored(
 ) -> bool {
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     ignore_paths.iter().any(|p| canonical_path.starts_with(p))
+}
+
+/// Check if any WIT files have been modified since the given time
+///
+/// This function checks for modifications in:
+/// - `wit/**/*.wit` - Interface definitions
+/// - `wit.toml` - WIT dependency configuration  
+/// - `Cargo.toml` - Rust WIT dependencies
+/// - `package.json` - TypeScript WIT dependencies
+///
+/// # Arguments
+/// * `project_dir` - The project directory to check
+/// * `wit_dir` - Optional WIT directory path (defaults to project_dir/wit)
+/// * `since` - Check for modifications since this time
+///
+/// # Returns
+/// True if any WIT-related files have been modified since `since`
+fn have_wit_files_changed(project_dir: &Path, wit_dir: Option<&Path>, since: SystemTime) -> bool {
+    let default_wit_dir = project_dir.join("wit");
+    let wit_dir = wit_dir.unwrap_or(&default_wit_dir);
+
+    // Check WIT directory for .wit files (excluding deps subdirectory as mentioned in the issue)
+    if wit_dir.exists() && let Ok(entries) = std::fs::read_dir(wit_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Skip the deps directory as requested
+            if path.is_dir() && path.file_name().and_then(|n| n.to_str()) == Some("deps") {
+                continue;
+            }
+
+            // Check .wit files
+            if path.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("wit")
+                && let Ok(metadata) = entry.metadata()
+                && let Ok(modified) = metadata.modified()
+                && modified > since
+            {
+                return true;
+            }
+        }
+    }
+
+    // Check WIT configuration files
+    let config_files = [
+        project_dir.join("wit.toml"),
+        project_dir.join("Cargo.toml"),
+        project_dir.join("package.json"),
+    ];
+
+    for config_file in &config_files {
+        if config_file.exists()
+            && let Ok(metadata) = config_file.metadata()
+            && let Ok(modified) = metadata.modified()
+            && modified > since
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Build a set of paths that should be ignored during file watching
@@ -505,6 +567,9 @@ impl CliCommand for DevCommand {
         // Make sure the reload channel is empty before starting the loop
         let _ = reload_rx.try_recv();
 
+        // Track the last time we checked for WIT changes (start from now)
+        let mut last_wit_check = SystemTime::now();
+
         info!("development session started successfully");
         info!(address = %format!("{}://{}", protocol, self.address), "listening for HTTP requests");
 
@@ -517,13 +582,40 @@ impl CliCommand for DevCommand {
 
                     info!("rebuilding component after file changed ...");
 
+                    // Check if WIT files have changed since the last check
+                    let wit_dir = config.wit.as_ref().and_then(|w| w.wit_dir.as_ref().map(|p| {
+                        if p.is_absolute() { p.clone() } else { self.project_dir.join(p) }
+                    }));
+                    let wit_changed = have_wit_files_changed(
+                        &self.project_dir,
+                        wit_dir.as_deref(),
+                        last_wit_check,
+                    );
+
+                    // Create modified config with conditional WIT fetch skipping
+                    let mut build_config = config.clone();
+                    if !wit_changed {
+                        debug!("no WIT files changed since last build, skipping WIT dependency fetch");
+                        if let Some(wit) = build_config.wit.as_mut() {
+                            wit.skip_fetch = true;
+                        } else {
+                            build_config.wit = Some(crate::wit::WitConfig {
+                                skip_fetch: true,
+                                ..Default::default()
+                            });
+                        }
+                    } else {
+                        debug!("WIT files changed, will fetch dependencies");
+                        // Update the last WIT check time
+                        last_wit_check = SystemTime::now();
+                    }
+
                     // TODO(IMPORTANT): ensure that this calls the build pre-post hooks
-                    // TODO(#21): Skip wit fetch if no .wit change
                     // TODO(#22): Typescript: Skip install if no package.json change
                     let rebuild_result = build_component(
                         &self.project_dir,
                         ctx,
-                        &config,
+                        &build_config,
                     ).await;
 
                     match rebuild_result {
@@ -999,7 +1091,7 @@ mod tests {
 
         // Test file accessed through symlink
         let file_through_symlink = symlink_target.join("test.txt");
-        fs::write(&external_target.join("test.txt"), "content").expect("failed to write test file");
+        fs::write(external_target.join("test.txt"), "content").expect("failed to write test file");
 
         // Should be ignored because the symlink resolves to target/ pattern
         assert!(is_ignored(
